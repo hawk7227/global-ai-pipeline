@@ -1,10 +1,15 @@
 name: Shared Autonomous AI Engine
 
 on:
+  workflow_dispatch:
   workflow_call:
     secrets:
       OPENAI_API_KEY:
         required: true
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/reusable-agent.yml'
 
 permissions:
   contents: write
@@ -23,13 +28,22 @@ jobs:
         with:
           node-version: 20
 
+      - name: Verify OpenAI credential
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY repository secret is required."
+            exit 1
+          fi
+
       - name: Install System Managers
         run: |
           npm install -g pnpm tsx zod @openai/agents
           pnpm install --no-frozen-lockfile || echo "No local package.json found yet"
 
       - name: Fetch Global Agent Script
-        run: curl -sSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/cloud-agent.ts -o cloud-agent.ts
+        run: curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/cloud-agent.ts -o cloud-agent.ts
 
       - name: Execute Live Agent Router
         env:
@@ -41,7 +55,7 @@ jobs:
         if: always()
         run: |
           git config --global user.name "AI-Router-Agent"
-          git config --global user.email "agent@://github.com"
+          git config --global user.email "agent@users.noreply.github.com"
           if [ -n "$(git status --porcelain)" ]; then
             git add .
             git commit -m "chore(ai): universal self-healing patch remediation"
