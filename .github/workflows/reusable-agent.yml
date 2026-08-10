@@ -1,0 +1,49 @@
+name: Shared Autonomous AI Engine
+
+on:
+  workflow_call: # This critical line makes the workflow reusable by any other repo
+
+permissions:
+  contents: write
+
+jobs:
+  execute-shared-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install System Managers
+        run: |
+          npm install -g pnpm tsx zod @openai/agents
+          pnpm install --no-frozen-lockfile || echo "No local package.json found yet"
+
+      - name: Fetch Global Agent Script
+        # This downloads your master script into the active repo's pipeline container
+        run: curl -sSL https://githubusercontent.com -o cloud-agent.ts
+
+      - name: Execute Live Agent Router
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx tsx cloud-agent.ts
+
+      - name: Commit and Push AI Remediations
+        if: always()
+        run: |
+          git config --global user.name "AI-Router-Agent"
+          git config --global user.email "agent@://github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "chore(ai): universal self-healing patch remediation"
+            git push origin HEAD:${{ github.head_ref || github.ref_name }}
+          else
+            echo "Pipeline perfectly clean. No anomalies detected."
+          fi
