@@ -1,7 +1,10 @@
 name: Shared Autonomous AI Engine
 
 on:
-  workflow_call: # This critical line makes the workflow reusable by any other repo
+  workflow_call:
+    secrets:
+      OPENAI_API_KEY:
+        required: true
 
 permissions:
   contents: write
@@ -26,8 +29,7 @@ jobs:
           pnpm install --no-frozen-lockfile || echo "No local package.json found yet"
 
       - name: Fetch Global Agent Script
-        # This downloads your master script into the active repo's pipeline container
-        run: curl -sSL https://githubusercontent.com -o cloud-agent.ts
+        run: curl -sSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/cloud-agent.ts -o cloud-agent.ts
 
       - name: Execute Live Agent Router
         env:
