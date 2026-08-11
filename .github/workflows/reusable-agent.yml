@@ -42,13 +42,18 @@ jobs:
           npm install -g pnpm tsx zod @openai/agents
           pnpm install --no-frozen-lockfile || echo "No local package.json found yet"
 
-      - name: Fetch Global Agent Script
-        run: curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/cloud-agent.ts -o cloud-agent.ts
+      - name: Fetch Global Agent Runtime
+        run: |
+          mkdir -p context-firewall
+          curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/cloud-agent.ts -o cloud-agent.ts
+          curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/context-firewall/context-firewall.js -o context-firewall/context-firewall.js
+          curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/context-firewall/activate.js -o context-firewall/activate.js
 
       - name: Execute Live Agent Router
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --import=./context-firewall/activate.js
         run: npx tsx cloud-agent.ts
 
       - name: Commit and Push AI Remediations
