@@ -3,27 +3,142 @@ import path from 'path'
 import crypto from 'crypto'
 
 const INSTALL_FLAG = Symbol.for('context-firewall.openai-fetch-installed')
-const DEFAULTS = Object.freeze({
+const DEFAULTS = {
   maxFiles: 100,
-  maxFileBytes: 500_000,
-  maxContextChars: 60_000,
-  maxPromptChars: 12_000,
-  maxRequestTextChars: 60_000,
-  maxTextBlockChars: 20_000,
-  blockedNames: new Set(['.git','node_modules','.next','dist','build','coverage','.cache','.env','.env.local','.env.production','.env.development']),
-  blockedExtensions: new Set(['.png','.jpg','.jpeg','.gif','.webp','.ico','.pdf','.zip','.gz','.mp3','.mp4','.mov','.avi','.woff','.woff2','.ttf','.eot']),
-})
-function sha256(value){return crypto.createHash('sha256').update(value).digest('hex')}
-function normalizeRelative(root,file){return path.relative(root,file).split(path.sep).join('/')}
-function normalizeOptions(overrides={}){return {...DEFAULTS,...overrides,blockedNames:overrides.blockedNames?new Set(overrides.blockedNames):DEFAULTS.blockedNames,blockedExtensions:overrides.blockedExtensions?new Set(overrides.blockedExtensions):DEFAULTS.blockedExtensions}}
-function isBlocked(root,file,options){const parts=normalizeRelative(root,file).split('/');return parts.some((part)=>options.blockedNames.has(part))||options.blockedExtensions.has(path.extname(file).toLowerCase())}
-function isOpaqueAssetString(value){return /^data:(?:image|audio|video|application)\//i.test(value)}
-function redactSecrets(text){return String(text).replace(/sk-[A-Za-z0-9_-]{12,}/g,'[REDACTED_API_KEY]').replace(/(OPENAI_API_KEY\s*=\s*)[^\s'\"]+/gi,'$1[REDACTED]').replace(/(API_KEY\s*=\s*)[^\s'\"]+/gi,'$1[REDACTED]').replace(/(SECRET\s*=\s*)[^\s'\"]+/gi,'$1[REDACTED]').replace(/(PASSWORD\s*=\s*)[^\s'\"]+/gi,'$1[REDACTED]').replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]{12,}/gi,'$1[REDACTED]').replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/g,'[REDACTED_PRIVATE_KEY]')}
-function walk(root,current,options,out){if(out.length>options.maxFiles*10)return;for(const entry of fs.readdirSync(current,{withFileTypes:true})){const full=path.join(current,entry.name);if(isBlocked(root,full,options)||entry.isSymbolicLink())continue;if(entry.isDirectory())walk(root,full,options,out);else if(entry.isFile())out.push(full)}}
-function isDedupableArrayItem(value){return Boolean(value&&typeof value==='object'&&!Array.isArray(value)&&((('role'in value)&&('content'in value))||(('type'in value)&&(('text'in value)||('input_text'in value)))||(('path'in value)&&('hash'in value)&&('content'in value))))) }
-function sanitizeRequestValue(value,state,options){if(value===null||value===undefined)return value;if(typeof value==='string'){if(isOpaqueAssetString(value))return value;const clean=redactSecrets(value);if(clean.length>options.maxTextBlockChars)throw new Error(`CONTEXT_FIREWALL_TEXT_BLOCK_TOO_LARGE: limit ${options.maxTextBlockChars} characters`);state.textChars+=clean.length;if(state.textChars>options.maxRequestTextChars)throw new Error(`CONTEXT_FIREWALL_REQUEST_TOO_LARGE: limit ${options.maxRequestTextChars} text characters`);return clean}if(typeof value!=='object')return value;if(Array.isArray(value)){const output=[],seen=new Set();for(const item of value){const cleanItem=sanitizeRequestValue(item,state,options);if(isDedupableArrayItem(cleanItem)){const fingerprint=sha256(JSON.stringify(cleanItem));if(seen.has(fingerprint))continue;seen.add(fingerprint)}output.push(cleanItem)}return output}const output={};for(const [key,child] of Object.entries(value))output[key]=sanitizeRequestValue(child,state,options);return output}
-export function buildContext(rootDir,previousManifest={},overrides={}){const root=path.resolve(rootDir),options=normalizeOptions(overrides),files=[];walk(root,root,options,files);const manifest={},approved=[],seenHashes=new Set();let totalChars=0;for(const file of files){const stat=fs.statSync(file);if(stat.size>options.maxFileBytes)continue;let raw;try{raw=fs.readFileSync(file,'utf8')}catch{continue}const relative=normalizeRelative(root,file),hash=sha256(raw);manifest[relative]=hash;if(previousManifest[relative]===hash||seenHashes.has(hash))continue;seenHashes.add(hash);const content=redactSecrets(raw);totalChars+=content.length;if(approved.length>=options.maxFiles)throw new Error(`CONTEXT_FIREWALL_MAX_FILES: limit ${options.maxFiles}`);if(totalChars>options.maxContextChars)throw new Error(`CONTEXT_FIREWALL_MAX_CONTEXT: limit ${options.maxContextChars} characters`);approved.push({path:relative,hash,content})}return {approved,manifest,stats:{scannedFiles:files.length,approvedFiles:approved.length,contextChars:totalChars}}}
-export function filterPrompt(prompt,maxChars=DEFAULTS.maxPromptChars){const clean=redactSecrets(String(prompt??''));if(clean.length>maxChars)throw new Error(`CONTEXT_FIREWALL_PROMPT_TOO_LARGE: limit ${maxChars} characters`);return clean}
-export function sanitizeOpenAIRequest(payload,overrides={}){const options=normalizeOptions(overrides),state={textChars:0};return sanitizeRequestValue(payload,state,options)}
-export function assertModelAllowed(model,allowedModels){if(!Array.isArray(allowedModels)||allowedModels.length===0)return model;if(!allowedModels.includes(model))throw new Error(`CONTEXT_FIREWALL_MODEL_BLOCKED: ${model}`);return model}
-export function installOpenAIFetchFirewall(overrides={}){if(globalThis[INSTALL_FLAG])return;const originalFetch=globalThis.fetch;if(typeof originalFetch!=='function')throw new Error('CONTEXT_FIREWALL_FETCH_UNAVAILABLE');const allowedHosts=new Set(Array.isArray(overrides.hosts)?overrides.hosts:['api.openai.com']);globalThis.fetch=async function contextFirewallFetch(input,init){let requestUrl='';if(typeof input==='string'||input instanceof URL)requestUrl=String(input);else if(input&&typeof input.url==='string')requestUrl=input.url;let hostname='';try{hostname=new URL(requestUrl).hostname}catch{return originalFetch(input,init)}if(!allowedHosts.has(hostname)||!init||typeof init.body!=='string')return originalFetch(input,init);const trimmed=init.body.trim();if(!trimmed.startsWith('{')&&!trimmed.startsWith('['))return originalFetch(input,init);let parsed;try{parsed=JSON.parse(init.body)}catch{return originalFetch(input,init)}const sanitized=sanitizeOpenAIRequest(parsed,overrides);return originalFetch(input,{...init,body:JSON.stringify(sanitized)})};globalThis[INSTALL_FLAG]=true}
+  maxFileBytes: 500000,
+  maxContextChars: 60000,
+  maxPromptChars: 12000,
+  maxRequestTextChars: 60000,
+  maxTextBlockChars: 20000,
+  blockedNames: ['.git','node_modules','.next','dist','build','coverage','.cache','.env','.env.local','.env.production','.env.development'],
+  blockedExtensions: ['.png','.jpg','.jpeg','.gif','.webp','.ico','.pdf','.zip','.gz','.mp3','.mp4','.mov','.avi','.woff','.woff2','.ttf','.eot'],
+}
+
+const digest = (value) => crypto.createHash('sha256').update(value).digest('hex')
+const rel = (root, file) => path.relative(root, file).split(path.sep).join('/')
+const optionsFor = (overrides = {}) => ({ ...DEFAULTS, ...overrides })
+const opaqueAsset = (value) => /^data:(?:image|audio|video|application)\//i.test(value)
+
+function redactSecrets(value) {
+  return String(value)
+    .replace(/sk-[A-Za-z0-9_-]{12,}/g, '[REDACTED_API_KEY]')
+    .replace(/(OPENAI_API_KEY\s*=\s*)[^\s'\"]+/gi, '$1[REDACTED]')
+    .replace(/(API_KEY\s*=\s*)[^\s'\"]+/gi, '$1[REDACTED]')
+    .replace(/(SECRET\s*=\s*)[^\s'\"]+/gi, '$1[REDACTED]')
+    .replace(/(PASSWORD\s*=\s*)[^\s'\"]+/gi, '$1[REDACTED]')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]{12,}/gi, '$1[REDACTED]')
+    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')
+}
+
+function blocked(root, file, options) {
+  const names = new Set(options.blockedNames)
+  const extensions = new Set(options.blockedExtensions)
+  return rel(root, file).split('/').some((part) => names.has(part)) || extensions.has(path.extname(file).toLowerCase())
+}
+
+function walk(root, current, options, files) {
+  for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+    const full = path.join(current, entry.name)
+    if (blocked(root, full, options) || entry.isSymbolicLink()) continue
+    if (entry.isDirectory()) walk(root, full, options, files)
+    else if (entry.isFile()) files.push(full)
+  }
+}
+
+function dedupable(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return ('role' in value && 'content' in value) || ('type' in value && ('text' in value || 'input_text' in value)) || ('path' in value && 'hash' in value && 'content' in value)
+}
+
+function sanitize(value, state, options) {
+  if (value == null) return value
+  if (typeof value === 'string') {
+    if (opaqueAsset(value)) return value
+    const clean = redactSecrets(value)
+    if (clean.length > options.maxTextBlockChars) throw new Error(`CONTEXT_FIREWALL_TEXT_BLOCK_TOO_LARGE: limit ${options.maxTextBlockChars} characters`)
+    state.textChars += clean.length
+    if (state.textChars > options.maxRequestTextChars) throw new Error(`CONTEXT_FIREWALL_REQUEST_TOO_LARGE: limit ${options.maxRequestTextChars} text characters`)
+    return clean
+  }
+  if (typeof value !== 'object') return value
+  if (Array.isArray(value)) {
+    const output = []
+    const seen = new Set()
+    for (const item of value) {
+      const clean = sanitize(item, state, options)
+      if (dedupable(clean)) {
+        const fingerprint = digest(JSON.stringify(clean))
+        if (seen.has(fingerprint)) continue
+        seen.add(fingerprint)
+      }
+      output.push(clean)
+    }
+    return output
+  }
+  const output = {}
+  for (const [key, child] of Object.entries(value)) output[key] = sanitize(child, state, options)
+  return output
+}
+
+export function buildContext(rootDir, previousManifest = {}, overrides = {}) {
+  const root = path.resolve(rootDir)
+  const options = optionsFor(overrides)
+  const files = []
+  walk(root, root, options, files)
+  const manifest = {}
+  const approved = []
+  const seen = new Set()
+  let contextChars = 0
+  for (const file of files) {
+    const stat = fs.statSync(file)
+    if (stat.size > options.maxFileBytes) continue
+    let raw
+    try { raw = fs.readFileSync(file, 'utf8') } catch { continue }
+    const filePath = rel(root, file)
+    const hash = digest(raw)
+    manifest[filePath] = hash
+    if (previousManifest[filePath] === hash || seen.has(hash)) continue
+    seen.add(hash)
+    const content = redactSecrets(raw)
+    contextChars += content.length
+    if (approved.length >= options.maxFiles) throw new Error(`CONTEXT_FIREWALL_MAX_FILES: limit ${options.maxFiles}`)
+    if (contextChars > options.maxContextChars) throw new Error(`CONTEXT_FIREWALL_MAX_CONTEXT: limit ${options.maxContextChars} characters`)
+    approved.push({ path: filePath, hash, content })
+  }
+  return { approved, manifest, stats: { scannedFiles: files.length, approvedFiles: approved.length, contextChars } }
+}
+
+export function filterPrompt(prompt, maxChars = DEFAULTS.maxPromptChars) {
+  const clean = redactSecrets(prompt ?? '')
+  if (clean.length > maxChars) throw new Error(`CONTEXT_FIREWALL_PROMPT_TOO_LARGE: limit ${maxChars} characters`)
+  return clean
+}
+
+export function sanitizeOpenAIRequest(payload, overrides = {}) {
+  return sanitize(payload, { textChars: 0 }, optionsFor(overrides))
+}
+
+export function assertModelAllowed(model, allowedModels) {
+  if (!Array.isArray(allowedModels) || allowedModels.length === 0) return model
+  if (!allowedModels.includes(model)) throw new Error(`CONTEXT_FIREWALL_MODEL_BLOCKED: ${model}`)
+  return model
+}
+
+export function installOpenAIFetchFirewall(overrides = {}) {
+  if (globalThis[INSTALL_FLAG]) return
+  const originalFetch = globalThis.fetch
+  if (typeof originalFetch !== 'function') throw new Error('CONTEXT_FIREWALL_FETCH_UNAVAILABLE')
+  const allowedHosts = new Set(Array.isArray(overrides.hosts) ? overrides.hosts : ['api.openai.com'])
+  globalThis.fetch = async (input, init) => {
+    const requestUrl = typeof input === 'string' || input instanceof URL ? String(input) : input?.url || ''
+    let hostname
+    try { hostname = new URL(requestUrl).hostname } catch { return originalFetch(input, init) }
+    if (!allowedHosts.has(hostname) || !init || typeof init.body !== 'string') return originalFetch(input, init)
+    const trimmed = init.body.trim()
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return originalFetch(input, init)
+    let parsed
+    try { parsed = JSON.parse(init.body) } catch { return originalFetch(input, init) }
+    return originalFetch(input, { ...init, body: JSON.stringify(sanitizeOpenAIRequest(parsed, overrides)) })
+  }
+  globalThis[INSTALL_FLAG] = true
+}
