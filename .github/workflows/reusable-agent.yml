@@ -1,70 +1,136 @@
-name: Shared Autonomous AI Engine
+name: Shared Live Repair Engine
 
 on:
-  workflow_dispatch:
   workflow_call:
-    secrets:
-      OPENAI_API_KEY:
+    inputs:
+      repair_task_id:
         required: true
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/reusable-agent.yml'
+        type: string
+      target_revision:
+        required: true
+        type: string
+      max_attempts:
+        required: false
+        type: number
+        default: 5
+    secrets:
+      AGENT_RUNTIME_KEY:
+        required: true
+      APP_DATA_URL:
+        required: true
+      APP_DATA_SERVICE_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      repair_task_id:
+        description: Immutable live repair task ID
+        required: true
+        type: string
+      target_revision:
+        description: Exact target repository revision
+        required: true
+        type: string
+      max_attempts:
+        description: Maximum verification command attempts
+        required: false
+        type: number
+        default: 5
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  execute-shared-agent:
+  execute-live-repair:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - name: Checkout Code
+      - name: Validate live repair inputs
+        env:
+          LIVE_REPAIR_TASK_ID: ${{ inputs.repair_task_id }}
+          LIVE_REPAIR_STARTING_REVISION: ${{ inputs.target_revision }}
+          AGENT_RUNTIME_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
+          APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
+          APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
+        run: |
+          test -n "$LIVE_REPAIR_TASK_ID"
+          test -n "$LIVE_REPAIR_STARTING_REVISION"
+          test -n "$AGENT_RUNTIME_KEY"
+          test -n "$APP_DATA_URL"
+          test -n "$APP_DATA_SERVICE_KEY"
+
+      - name: Checkout exact target revision
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.target_revision }}
           fetch-depth: 0
+
+      - name: Verify checkout revision
+        env:
+          LIVE_REPAIR_STARTING_REVISION: ${{ inputs.target_revision }}
+        run: |
+          ACTUAL_REVISION="$(git rev-parse HEAD)"
+          test "$ACTUAL_REVISION" = "$LIVE_REPAIR_STARTING_REVISION"
+          test -z "$(git status --porcelain)"
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Verify OpenAI credential
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "OPENAI_API_KEY repository secret is required."
-            exit 1
-          fi
-
-      - name: Install System Managers
+      - name: Install existing shared runtime prerequisites
         run: |
           npm install -g pnpm tsx zod @openai/agents
-          pnpm install --no-frozen-lockfile || echo "No local package.json found yet"
-
-      - name: Fetch Global Agent Runtime
-        run: |
-          mkdir -p context-firewall
-          curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/cloud-agent.ts -o cloud-agent.ts
-          curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/context-firewall/context-firewall.js -o context-firewall/context-firewall.js
-          curl -fsSL https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/main/context-firewall/activate.js -o context-firewall/activate.js
-
-      - name: Execute Live Agent Router
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_OPTIONS: --import=./context-firewall/activate.js
-        run: npx tsx cloud-agent.ts
-
-      - name: Commit and Push AI Remediations
-        if: always()
-        run: |
-          git config --global user.name "AI-Router-Agent"
-          git config --global user.email "agent@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add .
-            git commit -m "chore(ai): universal self-healing patch remediation"
-            git push origin HEAD:${{ github.head_ref || github.ref_name }}
-          else
-            echo "Pipeline perfectly clean. No anomalies detected."
+          if [ -f package.json ]; then
+            if [ -f pnpm-lock.yaml ]; then
+              pnpm install --frozen-lockfile
+            elif [ -f package-lock.json ]; then
+              npm ci
+            elif [ -f yarn.lock ]; then
+              yarn install --frozen-lockfile
+            else
+              npm install
+            fi
           fi
+
+      - name: Fetch shared live repair runtime
+        env:
+          SHARED_RUNTIME_REF: main
+        run: |
+          mkdir -p "$RUNNER_TEMP/live-repair-runtime/context-firewall" "$RUNNER_TEMP/live-repair-runtime/live-repair"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/cloud-agent.ts" -o "$RUNNER_TEMP/live-repair-runtime/cloud-agent.ts"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/live-repair/finalize.ts" -o "$RUNNER_TEMP/live-repair-runtime/live-repair/finalize.ts"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/context-firewall/context-firewall.js" -o "$RUNNER_TEMP/live-repair-runtime/context-firewall/context-firewall.js"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/context-firewall/activate.js" -o "$RUNNER_TEMP/live-repair-runtime/context-firewall/activate.js"
+
+      - name: Execute bounded live repair
+        id: repair
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
+          APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
+          APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
+          LIVE_REPAIR_TASK_ID: ${{ inputs.repair_task_id }}
+          LIVE_REPAIR_STARTING_REVISION: ${{ inputs.target_revision }}
+          LIVE_REPAIR_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          LIVE_REPAIR_RESULT_PATH: ${{ runner.temp }}/live-repair-result.json
+          NODE_OPTIONS: --import=${{ runner.temp }}/live-repair-runtime/context-firewall/activate.js
+        run: npx tsx "$RUNNER_TEMP/live-repair-runtime/cloud-agent.ts"
+
+      - name: Require terminal repair result
+        if: always()
+        env:
+          LIVE_REPAIR_RESULT_PATH: ${{ runner.temp }}/live-repair-result.json
+        run: |
+          test -s "$LIVE_REPAIR_RESULT_PATH"
+          node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.env.LIVE_REPAIR_RESULT_PATH,"utf8")); if(!["REPAIR_VERIFIED","REPAIR_FAILED","HUMAN_CONFIRMATION_REQUIRED"].includes(r.status)) process.exit(1); console.log(r.status);'
+
+      - name: Finalize verified or human-review candidate
+        if: always()
+        env:
+          APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
+          APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
+          LIVE_REPAIR_TASK_ID: ${{ inputs.repair_task_id }}
+          LIVE_REPAIR_RESULT_PATH: ${{ runner.temp }}/live-repair-result.json
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx tsx "$RUNNER_TEMP/live-repair-runtime/live-repair/finalize.ts"
