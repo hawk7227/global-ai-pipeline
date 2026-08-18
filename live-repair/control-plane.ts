@@ -86,6 +86,27 @@ export async function pingControlPlane(): Promise<{ ok: boolean; policyVersion: 
   return controlPlane('/api/live-repair/runner-ping')
 }
 
+/**
+ * Sends a conversational update to the user.
+ *
+ * No label is sent and none is required: the agent writes normal prose. The control plane
+ * classifies material claims on its own, so nothing here can promote a claim by wording.
+ * A statement that contradicts recorded evidence is refused and comes back with a reason;
+ * an over-confident one is published in the language it earned. Ordinary conversation
+ * passes through untouched.
+ */
+export async function reportNote(taskId: string, input: {
+  kind: 'investigating' | 'hypothesis' | 'ruled_out' | 'finding' | 'plan' | 'action' | 'result' | 'blocked'
+  message: string
+  evidenceRef?: string | null
+  hypothesisId?: string | null
+}): Promise<{ accepted: boolean; verdict?: string; softened?: boolean; reason?: string }> {
+  return controlPlane(`/api/live-repair/tasks/${encodeURIComponent(taskId)}/notes`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
 /** Fetches the protected surface and the task's authoritative class. */
 export async function fetchProtectionSurface(taskId: string): Promise<ProtectionSurface> {
   return controlPlane<ProtectionSurface>(`/api/live-repair/protection-surface?taskId=${encodeURIComponent(taskId)}`)
