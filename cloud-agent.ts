@@ -1,8 +1,10 @@
 import { Agent, run, tool } from '@openai/agents'
 import { execSync } from 'child_process'
-import { readFileSync, writeFileSync, readdirSync, statSync } from 'fs'
+import { readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs'
 import { resolve, join, relative, sep } from 'path'
 import { z } from 'zod'
+import { fetchProtectionSurface, pingControlPlane, reportTransition, submitReceipt, submitResult, type ProtectionSurface } from './live-repair/control-plane'
+import { guardWorkspaceWrite, commandCanMutateSource, computeCandidateId, candidateDiff } from './live-repair/workspace-guard'
 
 const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd()
 const taskId = requiredEnv('LIVE_REPAIR_TASK_ID')
@@ -54,6 +56,12 @@ let currentState: RepairState = 'LOCATING_SOURCE'
 let diagnosis = ''
 let checkpointSha: string | null = null
 let terminalResult: FinalResult | null = null
+let candidateId: string | null = null
+let protectionSurface: ProtectionSurface | null = null
+const mutationRationales: Array<{ path: string; requirement: string; necessary: boolean }> = []
+const baselineChecks: Array<{ name: string; status: 'PASS' | 'FAIL' | 'SKIPPED' | 'DISABLED'; detail?: string | null }> = []
+const candidateChecks: Array<{ name: string; status: 'PASS' | 'FAIL' | 'SKIPPED' | 'DISABLED'; detail?: string | null }> = []
+const runCorrelationId = `${process.env.GITHUB_RUN_ID || 'local'}-${process.env.GITHUB_RUN_ATTEMPT || '1'}`
 
 const stateTransitions: Record<RepairState, RepairState[]> = {
   RECEIVED: ['EVIDENCE_VALIDATED', 'FAILED'],
@@ -113,24 +121,34 @@ function shellCommandAllowed(command: string): boolean {
   return blocked.every((pattern) => !pattern.test(trimmed))
 }
 
-async function dataRequest(path: string, init: RequestInit = {}) {
+/**
+ * READ-ONLY task retrieval.
+ *
+ * This was a general-purpose read/write helper: it carried the Supabase service role and
+ * was used to INSERT lifecycle events and PATCH live_repair_tasks, which let the runner
+ * write authoritative state around the control plane. It is now restricted to GET, and
+ * the method is asserted rather than assumed so a future edit cannot quietly restore
+ * write capability through the same function.
+ *
+ * The remaining read exists because task loading has not been redesigned yet. It cannot
+ * change any authoritative state.
+ */
+async function dataRead(path: string) {
   const response = await fetch(`${appDataUrl}/rest/v1/${path}`, {
-    ...init,
+    method: 'GET',
     headers: {
       apikey: appDataServiceKey,
       Authorization: `Bearer ${appDataServiceKey}`,
       'Content-Type': 'application/json',
-      Prefer: 'return=representation',
-      ...(init.headers || {}),
     },
   })
   const text = await response.text()
-  if (!response.ok) throw new Error(`Repair data request failed (${response.status}): ${text}`)
+  if (!response.ok) throw new Error(`Repair data read failed (${response.status}): ${text}`)
   return text ? JSON.parse(text) : null
 }
 
 async function loadTask(): Promise<RepairTask> {
-  const rows = await dataRequest(`live_repair_tasks?id=eq.${encodeURIComponent(taskId)}&select=*`)
+  const rows = await dataRead(`live_repair_tasks?id=eq.${encodeURIComponent(taskId)}&select=*`)
   if (!Array.isArray(rows) || rows.length !== 1) throw new Error(`Repair task ${taskId} was not found.`)
   const row = rows[0]
   const task: RepairTask = {
@@ -151,40 +169,57 @@ async function loadTask(): Promise<RepairTask> {
   return task
 }
 
-async function nextSequence(): Promise<number> {
-  const rows = await dataRequest(`live_repair_events?task_id=eq.${encodeURIComponent(taskId)}&select=sequence&order=sequence.desc&limit=1`)
-  return Array.isArray(rows) && rows[0]?.sequence ? Number(rows[0].sequence) + 1 : 1
-}
-
+/**
+ * Reports one lifecycle transition to the control plane as it actually occurs.
+ *
+ * Sequence allocation is gone from here: the application allocates it inside the same
+ * transaction as the transition, so two reports cannot collide. The local state machine
+ * check is kept as a fast local guard, but the application's decision is authoritative —
+ * a refused transition throws, and the runner does not advance `currentState`.
+ */
 async function emitStatus(state: RepairState, message: string, file: string | null = null, summary: string | null = null) {
   if (state !== currentState && !stateTransitions[currentState].includes(state)) {
     throw new Error(`Invalid live repair state transition: ${currentState} -> ${state}`)
   }
-  const sequence = await nextSequence()
-  await dataRequest('live_repair_events', {
-    method: 'POST',
-    body: JSON.stringify([{ id: crypto.randomUUID(), task_id: taskId, sequence, state, message, file, summary, created_at: new Date().toISOString() }]),
-  })
-  await dataRequest(`live_repair_tasks?id=eq.${encodeURIComponent(taskId)}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ current_state: state, updated_at: new Date().toISOString() }),
-  })
+  await reportTransition(taskId, { state, message, file, summary })
   currentState = state
 }
 
+/**
+ * Submits the candidate result and records the CANONICAL adjudication.
+ *
+ * The runner no longer writes final_status or final_result. What it submits is a claim;
+ * the application re-decides it against the recorded events, the candidate-bound receipts
+ * and the integrity evaluation, and may downgrade it. `terminalResult` therefore holds the
+ * decided status, not the requested one, so nothing downstream acts on a status the
+ * control plane rejected.
+ */
 async function persistFinalResult(result: FinalResult) {
-  await dataRequest(`live_repair_tasks?id=eq.${encodeURIComponent(taskId)}`, {
-    method: 'PATCH',
-    body: JSON.stringify({
-      final_status: result.status,
-      final_result: result,
-      diagnosis: result.diagnosis,
-      failure_code: result.failureCode,
-      updated_at: new Date().toISOString(),
-    }),
+  const adjudication = await submitResult(taskId, {
+    ...result,
+    candidateId,
+    mutationRationales,
+    baselineChecks,
+    candidateChecks,
+    candidateDiff: checkpointSha ? candidateDiff(workspaceDir, checkpointSha) : null,
   })
-  writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf-8')
-  terminalResult = result
+
+  const decided: FinalResult = { ...result, status: adjudication.decidedStatus as FinalStatus }
+  if (adjudication.downgraded) {
+    console.warn(`Control plane downgraded ${adjudication.claimedStatus} to ${adjudication.decidedStatus}: ${adjudication.reasons.join(' ')}`)
+  }
+
+  // The local artifact is workflow continuity only. finalize.ts must not branch on it;
+  // it asks the control plane for release authorization instead.
+  writeFileSync(resultPath, JSON.stringify({
+    ...decided,
+    submittedStatus: result.status,
+    canonicalStatus: adjudication.decidedStatus,
+    deliveryState: adjudication.delivery?.state ?? 'NOT_ELIGIBLE',
+    note: 'canonicalStatus is the control plane decision. This file is not authorization to release.',
+  }, null, 2), 'utf-8')
+
+  terminalResult = decided
 }
 
 function listChangedFiles(): string[] {
@@ -251,6 +286,12 @@ const createSourceCheckpoint = tool({
     const dirty = execSync('git status --porcelain', { cwd: workspaceDir, encoding: 'utf-8' }).trim()
     if (dirty) return { status: 'ERROR', message: 'Workspace is not clean before the repair checkpoint.' }
     checkpointSha = execSync('git rev-parse HEAD', { cwd: workspaceDir, encoding: 'utf-8' }).trim()
+    // Published so the delivery stage can recompute candidate identity from the same
+    // checkpoint. Without a shared checkpoint the two computations would disagree even for
+    // an unchanged tree, and the provenance recheck would fail for the wrong reason.
+    if (process.env.GITHUB_ENV) {
+      appendFileSync(process.env.GITHUB_ENV, `LIVE_REPAIR_CHECKPOINT_SHA=${checkpointSha}\n`)
+    }
     await emitStatus('CHECKPOINT_CREATED', 'Source checkpoint created.', null, checkpointMessage)
     return { status: 'SUCCESS', checkpointSha }
   },
@@ -259,10 +300,28 @@ const createSourceCheckpoint = tool({
 const patchCodeDiff = tool({
   name: 'patchCodeDiff',
   description: 'Performs one exact surgical search-and-replace patch in a workspace file.',
-  parameters: z.object({ relativePath: z.string(), searchBlock: z.string().min(1), replaceBlock: z.string() }),
-  execute: async ({ relativePath, searchBlock, replaceBlock }) => {
+  parameters: z.object({
+    relativePath: z.string(),
+    searchBlock: z.string().min(1),
+    replaceBlock: z.string(),
+    // Mutation accountability: the control plane blocks release on any task-created change
+    // with no recorded justification, so it is captured at the moment of the patch.
+    requirement: z.string().min(1).describe('Which established finding requires this exact change.'),
+  }),
+  execute: async ({ relativePath, searchBlock, replaceBlock, requirement }) => {
     if (!checkpointSha) return { status: 'ERROR', message: 'A source checkpoint is required before patching.' }
     if (isSensitivePath(relativePath)) return { status: 'ERROR', message: 'Sensitive files cannot be patched.' }
+
+    // PRE-WRITE protected-surface check. The policy comes from the control plane, and the
+    // path is canonicalised first so ./x, ../x, an absolute path or a symlink alias all
+    // resolve to the same decision. A refusal happens before any byte is written.
+    if (protectionSurface) {
+      const guard = guardWorkspaceWrite({ targetPath: relativePath, workspaceDir, surface: protectionSurface })
+      if (!guard.allowed) {
+        return { status: 'BLOCKED', message: guard.reason ?? 'Mutation refused by the enforcement protection surface.' }
+      }
+    }
+
     try {
       const target = resolveWorkspacePath(relativePath)
       const original = readFileSync(target, 'utf-8')
@@ -270,7 +329,13 @@ const patchCodeDiff = tool({
       if (occurrences !== 1) return { status: 'ERROR', message: `Expected exactly one search block match in ${relativePath}; found ${occurrences}.` }
       if (currentState === 'CHECKPOINT_CREATED') await emitStatus('PATCHING', 'Applying the bounded source repair.', relativePath)
       writeFileSync(target, original.replace(searchBlock, replaceBlock), 'utf-8')
-      return { status: 'SUCCESS', message: `Patched ${relativePath}.` }
+
+      mutationRationales.push({ path: relativePath, requirement, necessary: true })
+      // Candidate identity is recomputed from the actual diff after every mutation, so it
+      // always describes the current candidate rather than a stale one.
+      candidateId = computeCandidateId(workspaceDir, checkpointSha)
+
+      return { status: 'SUCCESS', message: `Patched ${relativePath}.`, candidateId }
     } catch (error) {
       return { status: 'ERROR', message: error instanceof Error ? error.message : String(error) }
     }
@@ -286,16 +351,70 @@ const runLiveCommand = tool({
   }),
   execute: async ({ command, purpose }) => {
     if (!shellCommandAllowed(command)) return { status: 'BLOCKED', output: 'Command blocked by repair runner policy.' }
+
+    // A guarded patch tool with an unguarded shell is not protection. In-place editors and
+    // file movers can reach protected source without passing the write guard, so they are
+    // refused for an ordinary repair; source mutation must go through patchCodeDiff.
+    const mutating = commandCanMutateSource(command)
+    if (mutating.capable && protectionSurface?.taskClass !== 'CONTROL_PLANE_MAINTENANCE') {
+      return {
+        status: 'BLOCKED',
+        output: `This command can modify source outside the guarded patch path (matched "${mutating.matched}"). Use patchCodeDiff so the target is checked against the enforcement protection surface before any write.`,
+      }
+    }
+
     activeBudget.attempts += 1
     if (activeBudget.attempts > activeBudget.maxAttempts) return { status: 'BUDGET_EXHAUSTED', output: 'Configured repair execution-attempt budget exhausted.' }
     if (currentState !== purpose) await emitStatus(purpose, `${purpose.replaceAll('_', ' ').toLowerCase()} running.`)
+
+    const startedAt = new Date().toISOString()
+    let exitCode: number | null = 0
+    let output = ''
+    let failed = false
     try {
-      const output = execSync(command, { cwd: workspaceDir, encoding: 'utf-8', stdio: 'pipe', maxBuffer: 10 * 1024 * 1024 })
-      return { status: 'SUCCESS', output }
+      output = execSync(command, { cwd: workspaceDir, encoding: 'utf-8', stdio: 'pipe', maxBuffer: 10 * 1024 * 1024 })
     } catch (error: unknown) {
       const failure = error as { stdout?: string; stderr?: string; message?: string; status?: number }
-      return { status: 'FAILED', exitCode: failure.status ?? null, output: failure.stdout || failure.stderr || failure.message || 'Command failed.' }
+      exitCode = failure.status ?? null
+      output = failure.stdout || failure.stderr || failure.message || 'Command failed.'
+      failed = true
     }
+    const finishedAt = new Date().toISOString()
+
+    // Checks are recorded on both sides of the checkpoint so the control plane can tell a
+    // pre-existing failure from one this candidate created.
+    const checkRecord = { name: `${purpose}:${command}`, status: (failed ? 'FAIL' : 'PASS') as 'PASS' | 'FAIL', detail: failed ? output.slice(0, 500) : null }
+    if (candidateId) candidateChecks.push(checkRecord)
+    else baselineChecks.push(checkRecord)
+
+    // A verification execution produces a receipt. This is the only way a required gate
+    // can reach PASS: the outcome comes from the command's exit status, not from prose.
+    if (purpose === 'BEHAVIOR_VERIFY' || purpose === 'REGRESSION_VERIFY') {
+      const gate = purpose === 'BEHAVIOR_VERIFY' ? 'BEHAVIOR' : 'REGRESSION'
+      try {
+        await submitReceipt(taskId, {
+          gate,
+          operation: command,
+          revision: requiredEnv('LIVE_REPAIR_STARTING_REVISION'),
+          outcome: failed ? 'FAIL' : 'PASS',
+          candidateId,
+          operationType: 'shell_command',
+          exitCode,
+          runCorrelationId,
+          evidenceRef: `${process.env.GITHUB_SERVER_URL || 'https://github.com'}/${process.env.GITHUB_REPOSITORY || ''}/actions/runs/${process.env.GITHUB_RUN_ID || ''}`,
+          startedAt,
+          finishedAt,
+          detail: output.slice(0, 2000),
+        })
+      } catch (receiptError) {
+        // A rejected receipt means the gate has no accepted evidence, which the control
+        // plane will treat as unverified. Surfaced rather than swallowed.
+        return { status: 'RECEIPT_REJECTED', exitCode, output, message: receiptError instanceof Error ? receiptError.message : String(receiptError) }
+      }
+    }
+
+    if (failed) return { status: 'FAILED', exitCode, output }
+    return { status: 'SUCCESS', output, candidateId }
   },
 })
 
@@ -309,6 +428,10 @@ const rollbackWorkspace = tool({
     execSync(`git reset --hard ${checkpointSha}`, { cwd: workspaceDir, encoding: 'utf-8', stdio: 'pipe' })
     const dirty = execSync('git status --porcelain', { cwd: workspaceDir, encoding: 'utf-8' }).trim()
     if (dirty) return { status: 'ERROR', message: `Rollback left a dirty workspace: ${dirty}` }
+    // The candidate no longer exists once its changes are reverted; receipts bound to it
+    // must not appear to describe whatever is built next.
+    candidateId = null
+    mutationRationales.length = 0
     return { status: 'SUCCESS', checkpointSha }
   },
 })
@@ -356,7 +479,17 @@ const completeRepair = tool({
   },
 })
 
+// Fail fast and unambiguously on a runtime-key mismatch.
+const ping = await pingControlPlane()
+console.log(`Control plane reachable and authenticated. Policy ${ping.policyVersion ?? 'unknown'}.`)
+
 const task = await loadTask()
+
+// The protected surface and this task's authoritative class come from the control plane.
+// Fetching rather than embedding keeps one definition of what is protected, and the class
+// is whatever the stored task says — the runner cannot promote itself.
+protectionSurface = await fetchProtectionSurface(taskId)
+console.log(`Enforcement policy ${protectionSurface.policyVersion}: ${protectionSurface.protectedPaths.length} protected paths, task class ${protectionSurface.taskClass}.`)
 
 const agent = new Agent({
   name: 'DropshipLiveRepairAgent',
