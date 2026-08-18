@@ -3,7 +3,7 @@ import { execSync } from 'child_process'
 import { readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs'
 import { resolve, join, relative, sep } from 'path'
 import { z } from 'zod'
-import { fetchProtectionSurface, pingControlPlane, reportTransition, submitReceipt, submitResult, type ProtectionSurface } from './live-repair/control-plane'
+import { fetchProtectionSurface, pingControlPlane, reportNote, reportTransition, submitReceipt, submitResult, type ProtectionSurface } from './live-repair/control-plane'
 import { guardWorkspaceWrite, commandCanMutateSource, computeCandidateId, candidateDiff } from './live-repair/workspace-guard'
 
 const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd()
@@ -491,10 +491,48 @@ const task = await loadTask()
 protectionSurface = await fetchProtectionSurface(taskId)
 console.log(`Enforcement policy ${protectionSurface.policyVersion}: ${protectionSurface.protectedPaths.length} protected paths, task class ${protectionSurface.taskClass}.`)
 
+/**
+ * The agent's voice.
+ *
+ * Reasoning is not restricted — it is made visible and labelled. A note is stored apart
+ * from the execution ledger and authorizes nothing, so the agent can think out loud
+ * without any of it becoming evidence. This is what turns a silent pipeline into
+ * something a person can follow.
+ */
+const shareThinking = tool({
+  name: 'shareThinking',
+  description: 'Send the user a normal, conversational update. Write the way an engineer talks to a colleague — no labels, no format. Use it when something meaningful happens, not for every file you read.',
+  parameters: z.object({
+    message: z.string().min(1).describe('What you want to say, in plain language. Speak normally.'),
+    kind: z.enum(['investigating', 'hypothesis', 'ruled_out', 'finding', 'plan', 'action', 'result', 'blocked'])
+      .describe("Roughly what this update is. Use 'ruled_out' with the same hypothesisId when you drop a theory."),
+    evidenceRef: z.string().nullable().describe('File, symbol, command or receipt that supports this, when there is one.'),
+    hypothesisId: z.string().nullable().describe('Reuse the same id when you later confirm or rule out an earlier hypothesis.'),
+  }),
+  execute: async ({ kind, message, evidenceRef, hypothesisId }) => {
+    // No epistemic label is sent. The control plane classifies material claims itself, so
+    // a label here would add nothing and could not promote a claim anyway.
+    const result = await reportNote(taskId, { kind, message, evidenceRef, hypothesisId })
+    return result
+  },
+})
+
 const agent = new Agent({
   name: 'DropshipLiveRepairAgent',
   instructions: `
 You are DropshipLiveRepairAgent. Execute exactly one immutable repair task against the exact checked-out repository revision.
+
+TALKING TO THE USER:
+- Use shareThinking to keep the user with you. Write like an engineer explaining work to a colleague: "The card image is wrapped in object-contain, which would give you those side bars if the source images are narrower than the card. Checking whether that's the component actually rendering."
+- No labels, no required format, no status prefixes. Just say what you mean.
+- Speculate openly. Say what you suspect, what you are about to check, what you expect, what you ruled out, what you do not know yet. "I'm not sure yet, I'm checking X against Y" is a good update.
+- Signal uncertainty in ordinary words. "This looks like a hydration mismatch" is fine as a theory. "The hydration mismatch is the root cause" is a statement of fact, so only say it once you have read the source that shows it.
+- Disagree with the user when the evidence says otherwise, and explain why.
+- Send an update when something meaningful happens: you form a real theory, you find the active source, you establish the cause, you start patching, a verification comes back, you rule a theory out, you hit a blocker, you roll back. Do not narrate every file read or search.
+
+ACT WHEN YOU KNOW:
+- The moment the active source shows you the cause, fix it. Do not keep investigating to look thorough, and do not write an essay instead of a patch. Extra searching after the cause is established is waste, not rigour.
+- If the fix is one line and the evidence is in front of you, make it one line. A single update like "Found it — the card image is constrained with object-contain, which creates the side space. Changing that one style now, then I'll verify the card." followed by the patch is the ideal shape of a repair.
 
 ABSOLUTE EXECUTION RULES:
 - Never simulate execution, build success, browser interaction, Git state, logs, deployment state, root cause, or verification.
@@ -524,7 +562,8 @@ ORDERED REPAIR PROTOCOL:
 9. Run proportional adjacent regression checks.
 10. Call completeRepair exactly once with changed files matching actual Git state.
 `,
-  tools: [scanDirectoryTree, readTargetFile, recordDiagnosis, createSourceCheckpoint, patchCodeDiff, runLiveCommand, rollbackWorkspace, completeRepair],
+  tools: [
+    shareThinking, scanDirectoryTree, readTargetFile, recordDiagnosis, createSourceCheckpoint, patchCodeDiff, runLiveCommand, rollbackWorkspace, completeRepair],
 })
 
 const objective = `Execute this repair task exactly as submitted:\n${JSON.stringify(task, null, 2)}`
