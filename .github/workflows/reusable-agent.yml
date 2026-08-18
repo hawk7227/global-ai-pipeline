@@ -23,14 +23,6 @@ on:
         description: Base URL of the Live Repair application control plane. All authoritative state is written through it.
       APP_DATA_SERVICE_KEY:
         required: true
-      MODEL_API_KEY:
-        required: true
-        description: >-
-          Inference-provider credential for the agent runtime. Separate trust domain from
-          AGENT_RUNTIME_KEY, which authenticates the runner to the Live Repair application.
-          This was previously satisfied by passing AGENT_RUNTIME_KEY as OPENAI_API_KEY;
-          the two are no longer interchangeable. Mapped below to the environment variable
-          the installed SDK actually reads.
   workflow_dispatch:
     inputs:
       repair_task_id:
@@ -64,16 +56,13 @@ jobs:
           APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
           APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
           LIVE_REPAIR_APP_URL: ${{ secrets.LIVE_REPAIR_APP_URL }}
-          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
         run: |
-          # Presence only. No secret value is echoed at any point in this workflow.
           test -n "$LIVE_REPAIR_TASK_ID"
           test -n "$LIVE_REPAIR_STARTING_REVISION"
           test -n "$AGENT_RUNTIME_KEY"
           test -n "$APP_DATA_URL"
           test -n "$APP_DATA_SERVICE_KEY"
           test -n "$LIVE_REPAIR_APP_URL"
-          test -n "$MODEL_API_KEY"
 
       - name: Checkout exact target revision
         uses: actions/checkout@v4
@@ -144,16 +133,7 @@ jobs:
         id: repair
         continue-on-error: true
         env:
-          # Runner -> Live Repair application authentication. Required by control-plane.ts
-          # for the ping, protection-surface fetch, event reporting, receipt submission and
-          # result submission. It was previously absent from this step, so the first call
-          # would have failed before the repair began.
-          AGENT_RUNTIME_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
-          # Runner -> inference provider. A distinct trust domain: this credential must not
-          # be able to authenticate to the control plane, and the control-plane key must not
-          # be usable as a model credential. OPENAI_API_KEY is the variable the installed
-          # @openai/agents runtime reads; only this mapping changes if the provider changes.
-          OPENAI_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
           APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
           APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
           LIVE_REPAIR_APP_URL: ${{ secrets.LIVE_REPAIR_APP_URL }}
@@ -175,17 +155,10 @@ jobs:
       - name: Finalize verified or human-review candidate
         if: always()
         env:
-          # Required for release authorization and delivery reporting. finalize.ts cannot
-          # ask the control plane whether delivery is authorized without it, and must never
-          # fall back to deciding for itself.
-          AGENT_RUNTIME_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
+          APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
+          APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
           LIVE_REPAIR_APP_URL: ${{ secrets.LIVE_REPAIR_APP_URL }}
           LIVE_REPAIR_TASK_ID: ${{ inputs.repair_task_id }}
           LIVE_REPAIR_RESULT_PATH: ${{ runner.temp }}/live-repair-result.json
-          # LIVE_REPAIR_CHECKPOINT_SHA is not declared here: cloud-agent.ts writes it to
-          # GITHUB_ENV at checkpoint creation, and GitHub exposes it to later steps in the
-          # same job automatically. Delivery must stay in this job for that reason.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # No model credential is passed. Delivery performs Git operations and control-plane
-        # calls only; it runs no inference.
         run: npx tsx "$RUNNER_TEMP/live-repair-runtime/live-repair/finalize.ts"
