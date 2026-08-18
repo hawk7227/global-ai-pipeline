@@ -13,18 +13,28 @@ on:
         required: false
         type: number
         default: 5
+    # These are declared optional ON PURPOSE.
+    #
+    # With required: true, a secret that is not set on the calling repository makes GitHub
+    # reject the workflow at STARTUP — before any step runs, with no step log and only a
+    # generic startup_failure. That is indistinguishable from a malformed workflow and
+    # tells an operator nothing about which secret is missing.
+    #
+    # Declared optional, the run starts and the first step names the missing secret. The
+    # requirement is not weakened: the validate step below still refuses to continue
+    # without every one of them.
     secrets:
       AGENT_RUNTIME_KEY:
-        required: true
+        required: false
       APP_DATA_URL:
-        required: true
+        required: false
       LIVE_REPAIR_APP_URL:
-        required: true
+        required: false
         description: Base URL of the Live Repair application control plane. All authoritative state is written through it.
       APP_DATA_SERVICE_KEY:
-        required: true
+        required: false
       MODEL_API_KEY:
-        required: true
+        required: false
         description: >-
           Inference-provider credential for the agent runtime. Separate trust domain from
           AGENT_RUNTIME_KEY, which authenticates the runner to the Live Repair application.
@@ -67,13 +77,30 @@ jobs:
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
         run: |
           # Presence only. No secret value is echoed at any point in this workflow.
-          test -n "$LIVE_REPAIR_TASK_ID"
-          test -n "$LIVE_REPAIR_STARTING_REVISION"
-          test -n "$AGENT_RUNTIME_KEY"
-          test -n "$APP_DATA_URL"
-          test -n "$APP_DATA_SERVICE_KEY"
-          test -n "$LIVE_REPAIR_APP_URL"
-          test -n "$MODEL_API_KEY"
+          # Each check names what is missing and where to set it, because "test -n" alone
+          # produced an exit code and nothing an operator could act on.
+          missing=""
+          for pair in \
+            "LIVE_REPAIR_TASK_ID:workflow input repair_task_id" \
+            "LIVE_REPAIR_STARTING_REVISION:workflow input target_revision" \
+            "AGENT_RUNTIME_KEY:repository secret (must match AGENT_RUNTIME_KEY on the application deployment)" \
+            "APP_DATA_URL:repository secret" \
+            "APP_DATA_SERVICE_KEY:repository secret" \
+            "LIVE_REPAIR_APP_URL:repository secret (base URL of the Live Repair application)" \
+            "MODEL_API_KEY:repository secret (inference provider credential)"; do
+            name="${pair%%:*}"
+            where="${pair#*:}"
+            value="$(printenv "$name" || true)"
+            if [ -z "$value" ]; then
+              echo "::error::$name is empty or not set. Set it as a $where on the repository that dispatches this workflow."
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing required configuration:$missing"
+            exit 1
+          fi
+          echo "All required inputs and secrets are present." 
 
       - name: Checkout exact target revision
         uses: actions/checkout@v4
@@ -189,3 +216,4 @@ jobs:
         # No model credential is passed. Delivery performs Git operations and control-plane
         # calls only; it runs no inference.
         run: npx tsx "$RUNNER_TEMP/live-repair-runtime/live-repair/finalize.ts"
+
