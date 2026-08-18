@@ -1,0 +1,218 @@
+name: Shared Live Repair Engine
+
+on:
+  workflow_call:
+    inputs:
+      repair_task_id:
+        required: true
+        type: string
+      target_revision:
+        required: true
+        type: string
+      max_attempts:
+        required: false
+        type: number
+        default: 5
+    # These are declared optional ON PURPOSE.
+    #
+    # With required: true, a secret that is not set on the calling repository makes GitHub
+    # reject the workflow at STARTUP — before any step runs, with no step log and only a
+    # generic startup_failure. That is indistinguishable from a malformed workflow and
+    # tells an operator nothing about which secret is missing.
+    #
+    # Declared optional, the run starts and the first step names the missing secret. The
+    # requirement is not weakened: the validate step below still refuses to continue
+    # without every one of them.
+    secrets:
+      AGENT_RUNTIME_KEY:
+        required: false
+      APP_DATA_URL:
+        required: false
+      LIVE_REPAIR_APP_URL:
+        required: false
+        description: Base URL of the Live Repair application control plane. All authoritative state is written through it.
+      APP_DATA_SERVICE_KEY:
+        required: false
+      MODEL_API_KEY:
+        required: false
+        description: >-
+          Inference-provider credential for the agent runtime. Separate trust domain from
+          AGENT_RUNTIME_KEY, which authenticates the runner to the Live Repair application.
+          This was previously satisfied by passing AGENT_RUNTIME_KEY as OPENAI_API_KEY;
+          the two are no longer interchangeable. Mapped below to the environment variable
+          the installed SDK actually reads.
+  workflow_dispatch:
+    inputs:
+      repair_task_id:
+        description: Immutable live repair task ID
+        required: true
+        type: string
+      target_revision:
+        description: Exact target repository revision
+        required: true
+        type: string
+      max_attempts:
+        description: Maximum verification command attempts
+        required: false
+        type: number
+        default: 5
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  execute-live-repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate live repair inputs
+        env:
+          LIVE_REPAIR_TASK_ID: ${{ inputs.repair_task_id }}
+          LIVE_REPAIR_STARTING_REVISION: ${{ inputs.target_revision }}
+          AGENT_RUNTIME_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
+          APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
+          APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
+          LIVE_REPAIR_APP_URL: ${{ secrets.LIVE_REPAIR_APP_URL }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+        run: |
+          # Presence only. No secret value is echoed at any point in this workflow.
+          # Each check names what is missing and where to set it, because "test -n" alone
+          # produced an exit code and nothing an operator could act on.
+          missing=""
+          for pair in \
+            "LIVE_REPAIR_TASK_ID:workflow input repair_task_id" \
+            "LIVE_REPAIR_STARTING_REVISION:workflow input target_revision" \
+            "AGENT_RUNTIME_KEY:repository secret (must match AGENT_RUNTIME_KEY on the application deployment)" \
+            "APP_DATA_URL:repository secret" \
+            "APP_DATA_SERVICE_KEY:repository secret" \
+            "LIVE_REPAIR_APP_URL:repository secret (base URL of the Live Repair application)" \
+            "MODEL_API_KEY:repository secret (inference provider credential)"; do
+            name="${pair%%:*}"
+            where="${pair#*:}"
+            value="$(printenv "$name" || true)"
+            if [ -z "$value" ]; then
+              echo "::error::$name is empty or not set. Set it as a $where on the repository that dispatches this workflow."
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing required configuration:$missing"
+            exit 1
+          fi
+          echo "All required inputs and secrets are present." 
+
+      - name: Checkout exact target revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_revision }}
+          fetch-depth: 0
+
+      - name: Verify checkout revision
+        env:
+          LIVE_REPAIR_STARTING_REVISION: ${{ inputs.target_revision }}
+        run: |
+          ACTUAL_REVISION="$(git rev-parse HEAD)"
+          test "$ACTUAL_REVISION" = "$LIVE_REPAIR_STARTING_REVISION"
+          test -z "$(git status --porcelain)"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install existing shared runtime prerequisites
+        run: |
+          npm install -g pnpm tsx zod @openai/agents
+          if [ -f package.json ]; then
+            if [ -f pnpm-lock.yaml ]; then
+              pnpm install --frozen-lockfile
+            elif [ -f package-lock.json ]; then
+              npm ci
+            elif [ -f yarn.lock ]; then
+              yarn install --frozen-lockfile
+            else
+              npm install
+            fi
+          fi
+
+      # The runtime is pinned to ONE immutable commit and every file is fetched from that
+      # same revision. Fetching from a moving branch allowed a deployment race to assemble
+      # cloud-agent.ts, control-plane.ts and workspace-guard.ts from different commits,
+      # which is not a reproducible execution environment. The resolved SHA is recorded as
+      # the runner revision for the run's evidence.
+      - name: Resolve and pin shared runtime revision
+        id: runtime
+        env:
+          SHARED_RUNTIME_BRANCH: main
+        run: |
+          RESOLVED=$(git ls-remote https://github.com/hawk7227/global-ai-pipeline.git "refs/heads/${SHARED_RUNTIME_BRANCH}" | cut -f1)
+          test -n "$RESOLVED"
+          echo "sha=$RESOLVED" >> "$GITHUB_OUTPUT"
+          echo "LIVE_REPAIR_RUNNER_REVISION=$RESOLVED" >> "$GITHUB_ENV"
+          echo "Pinned shared runtime revision: $RESOLVED"
+
+      - name: Fetch shared live repair runtime
+        env:
+          SHARED_RUNTIME_REF: ${{ steps.runtime.outputs.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/live-repair-runtime/context-firewall" "$RUNNER_TEMP/live-repair-runtime/live-repair"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/cloud-agent.ts" -o "$RUNNER_TEMP/live-repair-runtime/cloud-agent.ts"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/live-repair/finalize.ts" -o "$RUNNER_TEMP/live-repair-runtime/live-repair/finalize.ts"
+          # Both new modules are imported by cloud-agent.ts and finalize.ts. Without them
+          # the runtime fails at import rather than falling back to the old direct-write
+          # path, which is the correct failure mode.
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/live-repair/control-plane.ts" -o "$RUNNER_TEMP/live-repair-runtime/live-repair/control-plane.ts"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/live-repair/workspace-guard.ts" -o "$RUNNER_TEMP/live-repair-runtime/live-repair/workspace-guard.ts"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/context-firewall/context-firewall.js" -o "$RUNNER_TEMP/live-repair-runtime/context-firewall/context-firewall.js"
+          curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/context-firewall/activate.js" -o "$RUNNER_TEMP/live-repair-runtime/context-firewall/activate.js"
+
+      - name: Execute bounded live repair
+        id: repair
+        continue-on-error: true
+        env:
+          # Runner -> Live Repair application authentication. Required by control-plane.ts
+          # for the ping, protection-surface fetch, event reporting, receipt submission and
+          # result submission. It was previously absent from this step, so the first call
+          # would have failed before the repair began.
+          AGENT_RUNTIME_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
+          # Runner -> inference provider. A distinct trust domain: this credential must not
+          # be able to authenticate to the control plane, and the control-plane key must not
+          # be usable as a model credential. OPENAI_API_KEY is the variable the installed
+          # @openai/agents runtime reads; only this mapping changes if the provider changes.
+          OPENAI_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          APP_DATA_URL: ${{ secrets.APP_DATA_URL }}
+          APP_DATA_SERVICE_KEY: ${{ secrets.APP_DATA_SERVICE_KEY }}
+          LIVE_REPAIR_APP_URL: ${{ secrets.LIVE_REPAIR_APP_URL }}
+          LIVE_REPAIR_TASK_ID: ${{ inputs.repair_task_id }}
+          LIVE_REPAIR_STARTING_REVISION: ${{ inputs.target_revision }}
+          LIVE_REPAIR_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          LIVE_REPAIR_RESULT_PATH: ${{ runner.temp }}/live-repair-result.json
+          NODE_OPTIONS: --import=${{ runner.temp }}/live-repair-runtime/context-firewall/activate.js
+        run: npx tsx "$RUNNER_TEMP/live-repair-runtime/cloud-agent.ts"
+
+      - name: Require terminal repair result
+        if: always()
+        env:
+          LIVE_REPAIR_RESULT_PATH: ${{ runner.temp }}/live-repair-result.json
+        run: |
+          test -s "$LIVE_REPAIR_RESULT_PATH"
+          node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.env.LIVE_REPAIR_RESULT_PATH,"utf8")); if(!["REPAIR_VERIFIED","REPAIR_FAILED","HUMAN_CONFIRMATION_REQUIRED"].includes(r.status)) process.exit(1); console.log(r.status);'
+
+      - name: Finalize verified or human-review candidate
+        if: always()
+        env:
+          # Required for release authorization and delivery reporting. finalize.ts cannot
+          # ask the control plane whether delivery is authorized without it, and must never
+          # fall back to deciding for itself.
+          AGENT_RUNTIME_KEY: ${{ secrets.AGENT_RUNTIME_KEY }}
+          LIVE_REPAIR_APP_URL: ${{ secrets.LIVE_REPAIR_APP_URL }}
+          LIVE_REPAIR_TASK_ID: ${{ inputs.repair_task_id }}
+          LIVE_REPAIR_RESULT_PATH: ${{ runner.temp }}/live-repair-result.json
+          # LIVE_REPAIR_CHECKPOINT_SHA is not declared here: cloud-agent.ts writes it to
+          # GITHUB_ENV at checkpoint creation, and GitHub exposes it to later steps in the
+          # same job automatically. Delivery must stay in this job for that reason.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # No model credential is passed. Delivery performs Git operations and control-plane
+        # calls only; it runs no inference.
+        run: npx tsx "$RUNNER_TEMP/live-repair-runtime/live-repair/finalize.ts"
