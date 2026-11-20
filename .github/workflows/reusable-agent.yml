@@ -167,6 +167,14 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/context-firewall/context-firewall.js" -o "$RUNNER_TEMP/live-repair-runtime/context-firewall/context-firewall.js"
           curl -fsSL "https://raw.githubusercontent.com/hawk7227/global-ai-pipeline/${SHARED_RUNTIME_REF}/context-firewall/activate.js" -o "$RUNNER_TEMP/live-repair-runtime/context-firewall/activate.js"
 
+          # 2026-11-20: the runtime uses top-level await (ESM). Fetched into a folder with no package.json, tsx
+          # compiled it as CommonJS and every run crashed before the agent started ("Top-level await is currently not
+          # supported with the cjs output format"). Mark the folder as an ES module and install its two libraries
+          # next to it (ES modules do not resolve globally installed packages).
+          cd "$RUNNER_TEMP/live-repair-runtime"
+          printf '{"private":true,"type":"module"}\n' > package.json
+          npm install --no-audit --no-fund zod @openai/agents
+
       - name: Execute bounded live repair
         id: repair
         continue-on-error: true
